@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kokoro"
+version = "0.9.4"
+description = "TTS"
+readme = "README.md"
+authors = [
+    { name="hexgrad", email="hello@hexgrad.com" }
+]
+license = { file = "LICENSE" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent"
+]
+requires-python = ">=3.10, <3.14"
+dependencies = [
+    "en-core-web-sm",
+    "fastapi>=0.118.0",
+    "huggingface_hub",
+    "langdetect>=1.0.9",
+    "loguru",
+    "misaki[en]>=0.9.4",
+    "numpy",
+    "python-multipart>=0.0.20",
+    "torch",
+    "transformers",
+    "uvicorn[standard]>=0.37.0",
+]
+
+[project.scripts]
+kokoro = "kokoro.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = ["kokoro"]
+only-packages = true
+
+[tool.uv.sources]
+en-core-web-sm = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+
+[project.urls]
+Homepage = "https://github.com/hexgrad/kokoro"
+Repository = "https://github.com/hexgrad/kokoro"
