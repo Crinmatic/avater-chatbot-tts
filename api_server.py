@@ -6,9 +6,12 @@ import torch
 import io
 import wave
 import logging
+import os
+import numpy as np
 from langdetect import detect, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
 from kokoro.pipeline import KPipeline
+import sherpa_onnx
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +41,9 @@ LANGUAGE_MAPPING = {
     'zh': 'z',  # Chinese
     'zh-cn': 'z',  # Chinese (Simplified)
     'zh-tw': 'z',  # Chinese (Traditional)
+    'fa': 'fa',  # Persian/Farsi
+    'ur': 'fa',  # Urdu (often detected for Persian text) -> map to Persian
+    'nan': 'nan',  # Min-nan (Southern Min/Taiwanese Hokkien)
 }
 
 # Default voices for each language (all female voices)
@@ -51,6 +57,8 @@ DEFAULT_VOICES = {
     'j': 'jf_alpha',    # Japanese Female
     'p': 'pf_dora',     # Portuguese Female
     'z': 'zf_xiaobei',  # Chinese Female
+    'fa': 'piper_fa_amir',  # Persian Female (Piper model)
+    'nan': 'piper_nan',  # Min-nan (Piper model)
 }
 
 class TTSRequest(BaseModel):
@@ -131,6 +139,13 @@ AVAILABLE_VOICES = {
     "zm_yunxi": {"language": "z", "description": "Chinese Male - Yunxi"},
     "zm_yunxia": {"language": "z", "description": "Chinese Male - Yunxia"},
     "zm_yunyang": {"language": "z", "description": "Chinese Male - Yunyang"},
+    
+    # Persian/Farsi (Piper models)
+    "piper_fa_amir": {"language": "fa", "description": "Persian (Farsi) - Amir (Piper)"},
+    "piper_fa_gyro": {"language": "fa", "description": "Persian (Farsi) - Gyro (Piper)"},
+    
+    # Min-nan / Southern Min / Taiwanese Hokkien (Piper model)
+    "piper_nan": {"language": "nan", "description": "Min-nan (Southern Min/Taiwanese Hokkien) - MMS (Piper)"},
 }
 
 def detect_language(text: str) -> str:
@@ -160,6 +175,10 @@ def detect_language(text: str) -> str:
 
 def select_voice(language: str, requested_voice: Optional[str] = None) -> str:
     """Select appropriate voice based on language and user preference."""
+    logger.info(f"select_voice called with language='{language}', requested_voice='{requested_voice}'")
+    logger.info(f"DEFAULT_VOICES keys: {list(DEFAULT_VOICES.keys())}")
+    logger.info(f"DEFAULT_VOICES.get('{language}'): {DEFAULT_VOICES.get(language)}")
+    
     if requested_voice and requested_voice in AVAILABLE_VOICES:
         # Check if the requested voice matches the language
         voice_lang = AVAILABLE_VOICES[requested_voice]["language"]
@@ -168,8 +187,24 @@ def select_voice(language: str, requested_voice: Optional[str] = None) -> str:
         return requested_voice
     
     # Use default voice for the detected language
-    default_voice = DEFAULT_VOICES.get(language, 'af_bella')
-    logger.info(f"Selected default voice '{default_voice}' for language '{language}'")
+    default_voice = DEFAULT_VOICES.get(language)
+    
+    # If no default voice found, try to find any voice for this language
+    if not default_voice:
+        logger.warning(f"No default voice found in DEFAULT_VOICES for language '{language}'")
+        for voice_id, voice_info in AVAILABLE_VOICES.items():
+            if voice_info["language"] == language:
+                default_voice = voice_id
+                logger.info(f"No default voice for language '{language}', using '{default_voice}'")
+                break
+    
+    # If still no voice found, default to American English
+    if not default_voice:
+        default_voice = 'af_bella'
+        logger.warning(f"No voice found for language '{language}', defaulting to English")
+    else:
+        logger.info(f"Selected default voice '{default_voice}' for language '{language}'")
+    
     return default_voice
 
 def get_or_create_pipeline(language: str, repo_id: Optional[str] = None) -> KPipeline:
@@ -188,6 +223,111 @@ def get_or_create_pipeline(language: str, repo_id: Optional[str] = None) -> KPip
             raise HTTPException(status_code=500, detail=f"Failed to initialize TTS pipeline: {str(e)}")
     
     return pipeline_cache[cache_key]
+
+# Piper TTS configuration
+PIPER_MODELS = {
+    "piper_fa_amir": {
+        "model": "models/vits-piper-fa_IR-amir-medium/fa_IR-amir-medium.onnx",
+        "tokens": "models/vits-piper-fa_IR-amir-medium/tokens.txt",
+        "data_dir": "models/vits-piper-fa_IR-amir-medium/espeak-ng-data",
+    },
+    "piper_fa_gyro": {
+        "model": "models/vits-piper-fa_IR-gyro-medium/fa_IR-gyro-medium.onnx",
+        "tokens": "models/vits-piper-fa_IR-gyro-medium/tokens.txt",
+        "data_dir": "models/vits-piper-fa_IR-gyro-medium/espeak-ng-data",
+    },
+    "piper_nan": {
+        "model": "models/vits-mms-nan/model.onnx",
+        "tokens": "models/vits-mms-nan/tokens.txt",
+        "data_dir": None,  # MMS models don't use espeak-ng-data
+    },
+}
+
+piper_tts_cache = {}
+
+def get_or_create_piper_tts(voice: str):
+    """Get or create a Piper TTS instance for the specified voice."""
+    if voice not in piper_tts_cache:
+        if voice not in PIPER_MODELS:
+            raise HTTPException(status_code=400, detail=f"Piper voice '{voice}' not found")
+        
+        model_config = PIPER_MODELS[voice]
+        logger.info(f"Creating new Piper TTS for voice: {voice}")
+        
+        # Get the absolute path to the models
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, model_config["model"])
+        tokens_path = os.path.join(base_dir, model_config["tokens"])
+        
+        # Check if files exist
+        if not os.path.exists(model_path):
+            raise HTTPException(status_code=500, detail=f"Model file not found: {model_path}")
+        if not os.path.exists(tokens_path):
+            raise HTTPException(status_code=500, detail=f"Tokens file not found: {tokens_path}")
+        
+        # Handle data_dir (optional for MMS models)
+        data_dir = None
+        if model_config["data_dir"]:
+            data_dir = os.path.join(base_dir, model_config["data_dir"])
+            if not os.path.exists(data_dir):
+                raise HTTPException(status_code=500, detail=f"Data directory not found: {data_dir}")
+        
+        try:
+            vits_model_config = sherpa_onnx.OfflineTtsVitsModelConfig(
+                model=model_path,
+                tokens=tokens_path,
+                data_dir=data_dir or "",  # Empty string if None
+                length_scale=1.0,
+                noise_scale=0.667,
+                noise_scale_w=0.8,
+            )
+            
+            model_config = sherpa_onnx.OfflineTtsModelConfig(
+                vits=vits_model_config,
+                num_threads=2,
+                debug=False,
+                provider="cpu",
+            )
+            
+            tts_config = sherpa_onnx.OfflineTtsConfig(
+                model=model_config,
+                max_num_sentences=1,
+            )
+            
+            piper_tts_cache[voice] = sherpa_onnx.OfflineTts(tts_config)
+            logger.info(f"Successfully created Piper TTS for voice: {voice}")
+        except Exception as e:
+            logger.error(f"Failed to create Piper TTS: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize Piper TTS: {str(e)}")
+    
+    return piper_tts_cache[voice]
+
+def piper_synthesize(text: str, voice: str, speed: float = 1.0) -> bytes:
+    """Synthesize speech using Piper TTS."""
+    tts = get_or_create_piper_tts(voice)
+    
+    # Generate audio
+    audio = tts.generate(text, speed=speed)
+    
+    # Convert to WAV bytes
+    sample_rate = tts.sample_rate
+    
+    # audio.samples is a list, convert to numpy array
+    audio_data = np.array(audio.samples, dtype=np.float32)
+    
+    # Normalize audio to 16-bit range
+    audio_16bit = (audio_data * 32767).astype(np.int16)
+    
+    # Create WAV file in memory
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, 'wb') as wav_file:
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(audio_16bit.tobytes())
+    
+    wav_buffer.seek(0)
+    return wav_buffer.read()
 
 def audio_to_wav_bytes(audio: torch.FloatTensor, sample_rate: int = 24000) -> bytes:
     """Convert audio tensor to WAV bytes."""
@@ -212,13 +352,14 @@ def audio_to_wav_bytes(audio: torch.FloatTensor, sample_rate: int = 24000) -> by
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "Kokoro TTS API with Auto Language Detection",
-        "version": "1.0.0",
+        "message": "Kokoro & Piper TTS API with Auto Language Detection",
+        "version": "2.0.0",
         "features": [
             "Automatic language detection from text",
             "Auto voice selection based on detected language",
-            "Support for 9 languages",
-            "Multiple voices per language"
+            "Support for 11 languages (including Persian and Min-nan)",
+            "Multiple voices per language",
+            "Dual backend: Kokoro TTS and Piper TTS"
         ],
         "endpoints": {
             "/synthesize": "POST - Generate speech from text (with auto language detection)",
@@ -273,7 +414,9 @@ async def detect_text_language(request: dict):
                 'i': 'Italian',
                 'j': 'Japanese',
                 'p': 'Portuguese',
-                'z': 'Chinese'
+                'z': 'Chinese',
+                'fa': 'Persian (Farsi)',
+                'nan': 'Min-nan (Southern Min/Taiwanese Hokkien)'
             }.get(detected_lang, 'American English'),
             "recommended_voice": recommended_voice,
             "voice_description": AVAILABLE_VOICES[recommended_voice]["description"]
@@ -311,31 +454,37 @@ async def synthesize_speech(request: TTSRequest):
                 detail=f"Voice '{request.voice}' not available. Use /voices endpoint to see available voices."
             )
         
-        # Get or create pipeline
-        pipeline = get_or_create_pipeline(request.language, request.repo_id)
-        
-        # Generate speech
-        logger.info(f"Generating speech for text: {request.text[:50]}...")
-        results = list(pipeline(
-            text=request.text,
-            voice=request.voice,
-            speed=request.speed
-        ))
-        
-        if not results:
-            raise HTTPException(status_code=500, detail="No audio generated")
-        
-        # Concatenate all audio results
-        audio_segments = [result.audio for result in results if result.audio is not None]
-        
-        if not audio_segments:
-            raise HTTPException(status_code=500, detail="No audio segments generated")
-        
-        # Concatenate audio
-        combined_audio = torch.cat(audio_segments, dim=-1)
-        
-        # Convert to WAV bytes
-        wav_bytes = audio_to_wav_bytes(combined_audio)
+        # Check if this is a Piper voice (Persian)
+        if request.voice.startswith("piper_"):
+            logger.info(f"Using Piper TTS for voice: {request.voice}")
+            wav_bytes = piper_synthesize(request.text, request.voice, request.speed)
+        else:
+            # Use Kokoro pipeline
+            logger.info(f"Using Kokoro TTS for voice: {request.voice}")
+            pipeline = get_or_create_pipeline(request.language, request.repo_id)
+            
+            # Generate speech
+            logger.info(f"Generating speech for text: {request.text[:50]}...")
+            results = list(pipeline(
+                text=request.text,
+                voice=request.voice,
+                speed=request.speed
+            ))
+            
+            if not results:
+                raise HTTPException(status_code=500, detail="No audio generated")
+            
+            # Concatenate all audio results
+            audio_segments = [result.audio for result in results if result.audio is not None]
+            
+            if not audio_segments:
+                raise HTTPException(status_code=500, detail="No audio segments generated")
+            
+            # Concatenate audio
+            combined_audio = torch.cat(audio_segments, dim=-1)
+            
+            # Convert to WAV bytes
+            wav_bytes = audio_to_wav_bytes(combined_audio)
         
         return Response(
             content=wav_bytes,
