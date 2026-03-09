@@ -2,15 +2,20 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
+import json
 import torch
+import torch.nn.functional as F
 import io
 import wave
 import logging
 import os
 import numpy as np
+import onnxruntime as ort
 from langdetect import detect, DetectorFactory
 from langdetect.lang_detect_exception import LangDetectException
 from kokoro.pipeline import KPipeline
+from piper_phonemize import phonemize_espeak, phoneme_ids_espeak
+from transformers import AutoTokenizer, VitsModel
 import sherpa_onnx
 
 # Set up logging
@@ -43,6 +48,7 @@ LANGUAGE_MAPPING = {
     'zh-tw': 'z',  # Chinese (Traditional)
     'fa': 'fa',  # Persian/Farsi
     'ur': 'fa',  # Urdu (often detected for Persian text) -> map to Persian
+    'yo': 'yo',  # Yoruba
     'nan': 'nan',  # Min-nan (Southern Min/Taiwanese Hokkien)
 }
 
@@ -58,6 +64,7 @@ DEFAULT_VOICES = {
     'p': 'pf_dora',     # Portuguese Female
     'z': 'zf_xiaobei',  # Chinese Female
     'fa': 'piper_fa_amir',  # Persian Female (Piper model)
+    'yo': 'piper_yo_olamide', # Yoruba (Piper/MMS model)
     'nan': 'piper_nan',  # Min-nan (Piper model)
 }
 
@@ -140,9 +147,11 @@ AVAILABLE_VOICES = {
     "zm_yunxia": {"language": "z", "description": "Chinese Male - Yunxia"},
     "zm_yunyang": {"language": "z", "description": "Chinese Male - Yunyang"},
     
-    # Persian/Farsi (Piper models)
+    # Persian/Farsi
     "piper_fa_amir": {"language": "fa", "description": "Persian (Farsi) - Amir (Piper)"},
-    "piper_fa_gyro": {"language": "fa", "description": "Persian (Farsi) - Gyro (Piper)"},
+    
+    # Yoruba (Piper/MMS models)
+    "piper_yo_olamide": {"language": "yo", "description": "Yoruba - Olamide (MMS/Piper)"},
     
     # Min-nan / Southern Min / Taiwanese Hokkien (Piper model)
     "piper_nan": {"language": "nan", "description": "Min-nan (Southern Min/Taiwanese Hokkien) - MMS (Piper)"},
@@ -226,16 +235,6 @@ def get_or_create_pipeline(language: str, repo_id: Optional[str] = None) -> KPip
 
 # Piper TTS configuration
 PIPER_MODELS = {
-    "piper_fa_amir": {
-        "model": "models/vits-piper-fa_IR-amir-medium/fa_IR-amir-medium.onnx",
-        "tokens": "models/vits-piper-fa_IR-amir-medium/tokens.txt",
-        "data_dir": "models/vits-piper-fa_IR-amir-medium/espeak-ng-data",
-    },
-    "piper_fa_gyro": {
-        "model": "models/vits-piper-fa_IR-gyro-medium/fa_IR-gyro-medium.onnx",
-        "tokens": "models/vits-piper-fa_IR-gyro-medium/tokens.txt",
-        "data_dir": "models/vits-piper-fa_IR-gyro-medium/espeak-ng-data",
-    },
     "piper_nan": {
         "model": "models/vits-mms-nan/model.onnx",
         "tokens": "models/vits-mms-nan/tokens.txt",
@@ -244,6 +243,172 @@ PIPER_MODELS = {
 }
 
 piper_tts_cache = {}
+transformer_tts_cache = {}
+direct_piper_tts_cache = {}
+
+TRANSFORMER_TTS_MODELS = {
+    "piper_yo_olamide": {
+        "repo_id": "facebook/mms-tts-yor",
+        "cache_dir": "models/hf-cache",
+    },
+}
+
+DIRECT_PIPER_TTS_MODELS = {
+    "piper_fa_amir": {
+        "model": "models/vits-fa-IR-amir-medium/fa_IR-amir-medium.onnx",
+        "config": "models/vits-fa-IR-amir-medium/fa_IR-amir-medium.onnx.json",
+        "silence_seconds": 0.15,
+    },
+}
+
+
+def get_or_create_transformer_tts(voice: str):
+    """Get or create a CPU-friendly transformers TTS instance for the specified voice."""
+    if voice not in transformer_tts_cache:
+        if voice not in TRANSFORMER_TTS_MODELS:
+            raise HTTPException(status_code=400, detail=f"Transformers voice '{voice}' not found")
+
+        voice_config = TRANSFORMER_TTS_MODELS[voice]
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        cache_dir = os.path.join(base_dir, voice_config["cache_dir"])
+
+        try:
+            logger.info(f"Loading transformers TTS for voice: {voice}")
+            tokenizer = AutoTokenizer.from_pretrained(
+                voice_config["repo_id"],
+                cache_dir=cache_dir,
+            )
+            model = VitsModel.from_pretrained(
+                voice_config["repo_id"],
+                cache_dir=cache_dir,
+            )
+            model.eval()
+            transformer_tts_cache[voice] = {
+                "tokenizer": tokenizer,
+                "model": model,
+                "sample_rate": int(model.config.sampling_rate),
+            }
+            logger.info(f"Successfully loaded transformers TTS for voice: {voice}")
+        except Exception as e:
+            logger.error(f"Failed to initialize transformers TTS: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize Yoruba TTS: {str(e)}")
+
+    return transformer_tts_cache[voice]
+
+
+def adjust_audio_speed(audio: torch.FloatTensor, speed: float) -> torch.FloatTensor:
+    """Apply a lightweight speed change by resampling the waveform length."""
+    if speed <= 0:
+        raise HTTPException(status_code=400, detail="Speed must be greater than 0")
+
+    if abs(speed - 1.0) < 1e-3:
+        return audio
+
+    target_length = max(1, int(audio.numel() / speed))
+    resized_audio = F.interpolate(
+        audio.view(1, 1, -1),
+        size=target_length,
+        mode="linear",
+        align_corners=False,
+    )
+    return resized_audio.view(-1)
+
+
+def transformer_synthesize(text: str, voice: str, speed: float = 1.0) -> bytes:
+    """Synthesize speech using a transformers-based TTS model."""
+    tts = get_or_create_transformer_tts(voice)
+    tokenizer = tts["tokenizer"]
+    model = tts["model"]
+
+    inputs = tokenizer(text, return_tensors="pt")
+
+    with torch.inference_mode():
+        waveform = model(**inputs).waveform.squeeze(0).cpu()
+
+    waveform = adjust_audio_speed(waveform, speed)
+    return audio_to_wav_bytes(waveform, sample_rate=tts["sample_rate"])
+
+
+def get_or_create_direct_piper_tts(voice: str):
+    """Get or create a direct ONNXRuntime Piper TTS instance for the specified voice."""
+    if voice not in direct_piper_tts_cache:
+        if voice not in DIRECT_PIPER_TTS_MODELS:
+            raise HTTPException(status_code=400, detail=f"Direct Piper voice '{voice}' not found")
+
+        voice_config = DIRECT_PIPER_TTS_MODELS[voice]
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, voice_config["model"])
+        config_path = os.path.join(base_dir, voice_config["config"])
+
+        if not os.path.exists(model_path):
+            raise HTTPException(status_code=500, detail=f"Model file not found: {model_path}")
+        if not os.path.exists(config_path):
+            raise HTTPException(status_code=500, detail=f"Model config file not found: {config_path}")
+
+        try:
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                model_json = json.load(config_file)
+
+            session = ort.InferenceSession(
+                model_path,
+                providers=["CPUExecutionProvider"],
+            )
+            sample_rate = int(model_json["audio"]["sample_rate"])
+            direct_piper_tts_cache[voice] = {
+                "session": session,
+                "sample_rate": sample_rate,
+                "espeak_voice": model_json.get("espeak", {}).get("voice", "fa"),
+                "silence_samples": int(sample_rate * voice_config["silence_seconds"]),
+            }
+            logger.info(f"Successfully loaded direct Piper TTS for voice: {voice}")
+        except Exception as e:
+            logger.error(f"Failed to initialize direct Piper TTS: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to initialize Persian TTS: {str(e)}")
+
+    return direct_piper_tts_cache[voice]
+
+
+def direct_piper_synthesize(text: str, voice: str, speed: float = 1.0) -> bytes:
+    """Synthesize speech using a direct ONNXRuntime Piper model."""
+    if speed <= 0:
+        raise HTTPException(status_code=400, detail="Speed must be greater than 0")
+
+    tts = get_or_create_direct_piper_tts(voice)
+    phoneme_sentences = phonemize_espeak(text, tts["espeak_voice"])
+
+    if not phoneme_sentences:
+        raise HTTPException(status_code=500, detail="No phonemes generated")
+
+    scales = np.array([0.667, 1.0 / speed, 0.8], dtype=np.float32)
+    audio_segments = []
+
+    for phonemes in phoneme_sentences:
+        phoneme_ids = phoneme_ids_espeak(phonemes)
+        if not phoneme_ids:
+            continue
+
+        output = tts["session"].run(
+            None,
+            {
+                "input": np.asarray([phoneme_ids], dtype=np.int64),
+                "input_lengths": np.asarray([len(phoneme_ids)], dtype=np.int64),
+                "scales": scales,
+            },
+        )[0]
+        audio_segments.append(np.asarray(output).squeeze().astype(np.float32))
+
+    if not audio_segments:
+        raise HTTPException(status_code=500, detail="No audio generated")
+
+    if len(audio_segments) == 1:
+        combined_audio = audio_segments[0]
+    else:
+        silence = np.zeros(tts["silence_samples"], dtype=np.float32)
+        combined_audio = np.concatenate(
+            [segment for pair in zip(audio_segments, [silence] * len(audio_segments)) for segment in pair][:-1]
+        )
+
+    return audio_to_wav_bytes(torch.from_numpy(combined_audio.copy()), sample_rate=tts["sample_rate"])
 
 def get_or_create_piper_tts(voice: str):
     """Get or create a Piper TTS instance for the specified voice."""
@@ -454,8 +619,14 @@ async def synthesize_speech(request: TTSRequest):
                 detail=f"Voice '{request.voice}' not available. Use /voices endpoint to see available voices."
             )
         
-        # Check if this is a Piper voice (Persian)
-        if request.voice.startswith("piper_"):
+        if request.voice in TRANSFORMER_TTS_MODELS:
+            logger.info(f"Using transformers TTS for voice: {request.voice}")
+            wav_bytes = transformer_synthesize(request.text, request.voice, request.speed)
+        elif request.voice in DIRECT_PIPER_TTS_MODELS:
+            logger.info(f"Using direct Piper TTS for voice: {request.voice}")
+            wav_bytes = direct_piper_synthesize(request.text, request.voice, request.speed)
+        # Check if this is a Piper voice (Persian/Min-nan)
+        elif request.voice.startswith("piper_"):
             logger.info(f"Using Piper TTS for voice: {request.voice}")
             wav_bytes = piper_synthesize(request.text, request.voice, request.speed)
         else:
